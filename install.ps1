@@ -47,7 +47,6 @@ if (Test-Path $inner) {
   Get-ChildItem -Force $inner | Move-Item -Destination $dest -Force
   Remove-Item -Recurse -Force $inner
 }
-Remove-Item -Recurse -Force $tmp
 
 # 4. Put the launcher dir on the user's PATH.
 $binDir = Join-Path $dest 'bin'
@@ -88,6 +87,24 @@ if ($shadow) {
   Write-Warning "  (this install: $expected)"
   Write-Warning "If 'codegraph --version' shows an unexpected version, remove the other copy"
   Write-Warning "(e.g. 'npm rm -g @colbymchenry/codegraph') or put '$binDir' first on your PATH."
+}
+
+# 6. Best-effort cleanup of the temp dir. Windows Defender occasionally still
+# holds the freshly downloaded zip for a moment; a lock here must NOT fail an
+# otherwise-complete install, so retry briefly, then warn only.
+$tmpRemoveTries = 3
+while ($tmpRemoveTries -gt 0) {
+  try {
+    Remove-Item -Recurse -Force $tmp
+    break
+  } catch {
+    $tmpRemoveTries--
+    if ($tmpRemoveTries -eq 0) {
+      Write-Warning "Could not remove temp dir $tmp - remove it manually later. ($($_.Exception.Message))"
+    } else {
+      Start-Sleep -Milliseconds 500
+    }
+  }
 }
 
 Write-Host "Run: codegraph --help"
