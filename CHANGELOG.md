@@ -25,7 +25,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- **Unity xLua projects see across the C# ↔ Lua boundary.** Calls through the `CS.` table, `LuaTable.Get<...>("Fight.Add")` bindings, and `GetCSharp` / `types[]` namespace-aliases now resolve across languages, so exploration follows a flow from a Lua script into its C# implementation and back.
+- **Unity xLua projects see across the C# ↔ Lua boundary.** Calls through the `CS.` table, `LuaTable.Get<...>("Fight.Add")` bindings, and `GetCSharp` / `types[]` namespace-aliases now resolve across languages, so exploration follows a flow from a Lua script into its C# implementation and back. Lua class-internal `self:Method()` calls and `self.field:Method()` calls into C# objects (fields typed by `AddComponent<T>()` / `CS.X.Instance` assignments) resolve too.
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 

@@ -160,3 +160,99 @@ describe('xlua bridge (C# ↔ Lua)', () => {
     }
   });
 });
+
+describe('xlua bridge — Lua self/field receivers', () => {
+  let tmpDir: string;
+  let cg: CodeGraph;
+
+  function nodeOutgoing(name: string, kind: Node['kind'], language: string): ReturnType<CodeGraph['getOutgoingEdges']> {
+    const n = cg
+      .getNodesByName(name)
+      .find((x) => x.kind === kind && x.language === language);
+    expect(n).toBeDefined();
+    return cg.getOutgoingEdges(n!.id);
+  }
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-xlua-self-'));
+    fs.mkdirSync(path.join(tmpDir, 'Game'));
+    fs.writeFileSync(path.join(tmpDir, 'Game/Player.cs'), CS_PLAYER);
+    fs.writeFileSync(
+      path.join(tmpDir, 'Game/LevelJobManager.cs'),
+      'namespace LevelManager.Job {\n    public class LevelJobManager {\n        public void Init(object callback) { }\n    }\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'LLM.lua'),
+      [
+        'local LLM = {}',
+        'function LLM:Init() end',
+        'function LLM:OnStart()',
+        '    self:Init()',
+        'end',
+        'function LLM:Setup()',
+        '    self.mgr = CS.MyGame.Player.Instance',
+        '    self.job = self.anyRoot:AddComponent(Player)',
+        'end',
+        'function LLM:Run()',
+        '    self.mgr:Go()',
+        '    self.job:Go()',
+        'end',
+        'function LLM:ToFunc(name) return name end',
+        'function LLM:RealSetup()',
+        '    self.levelJobRoot = GameObject()',
+        '    self.levelJobManager = self.levelJobRoot:AddComponent(LevelJobManager)',
+        'end',
+        'function LLM:RealCleanup()',
+        '    self.levelJobManager = nil',
+        'end',
+        'function LLM:RealRun()',
+        '    self.levelJobManager:Init(self:ToFunc("OnLevelRangeChanged"))',
+        'end',
+        'return LLM',
+      ].join('\n')
+    );
+    cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('links Lua self:Init() to the same-table method', () => {
+    const init = cg
+      .getNodesByName('Init')
+      .find((n) => n.kind === 'method' && n.language === 'lua');
+    expect(init).toBeDefined();
+    expect(init!.qualifiedName).toBe('LLM::Init');
+    const edges = nodeOutgoing('OnStart', 'method', 'lua');
+    const toInit = edges.find((e) => e.target === init!.id);
+    expect(toInit).toBeDefined();
+    expect(toInit!.kind).toBe('calls');
+  });
+
+  it('links Lua self.mgr:Go() to the C# method on the field type', () => {
+    const go = cg
+      .getNodesByName('Go')
+      .find((n) => n.kind === 'method' && n.language === 'csharp');
+    expect(go).toBeDefined();
+    expect(go!.qualifiedName).toBe('MyGame::Player::Go');
+    const edges = nodeOutgoing('Run', 'method', 'lua');
+    const toGo = edges.find((e) => e.target === go!.id);
+    expect(toGo).toBeDefined();
+    expect(toGo!.kind).toBe('calls');
+  });
+
+  it('reproduces the real LevelLoaderManager field-call shape', () => {
+    const init = cg
+      .getNodesByName('Init')
+      .find((n) => n.kind === 'method' && n.language === 'csharp' && n.qualifiedName.includes('LevelJobManager'));
+    expect(init).toBeDefined();
+    expect(init!.qualifiedName).toBe('LevelManager.Job::LevelJobManager::Init');
+    const edges = nodeOutgoing('RealRun', 'method', 'lua');
+    const toInit = edges.find((e) => e.target === init!.id);
+    expect(toInit).toBeDefined();
+    expect(toInit!.kind).toBe('calls');
+  });
+});

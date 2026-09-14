@@ -148,11 +148,152 @@ function csharpMethodOnType(typeNode: Node, methodName: string, context: Resolut
 }
 
 /**
+ * Lua internal `self` receiver resolution (metatable class idiom).
+ *
+ * `self:Method()` inside `function LevelLoaderManager:OnStart()` is the
+ * canonical Lua class call — but `self` is a keyword, so static analysis
+ * cannot name the table it refers to, and the upstream name-matcher has
+ * no Lua `self` handling (its `this.` equivalent exists for TS only).
+ * Every class-internal call therefore dies: `callers LevelLoaderManager.Init`
+ * is empty despite three `self:Init()` call sites.
+ *
+ * `self` is NOT dynamic though: inside method M of table T, `self:Method()`
+ * ALWAYS means T.Method — the receiver is the current method's own table.
+ * So we read the calling method off `ref.fromNodeId`, take its qualifiedName
+ * receiver (`LevelLoaderManager::OnStart` → `LevelLoaderManager`), and look
+ * for `LevelLoaderManager::Method` in the SAME file. Same-file + same-table
+ * double constraint — a wrong edge is near-impossible.
+ */
+function resolveLuaSelfCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = ref.referenceName.match(/^self[:.]([A-Za-z_]\w*)$/);
+  if (!m) return null;
+  const methodName = m[1]!;
+  if (!context.getNodeById) return null;
+  const fromNode = context.getNodeById(ref.fromNodeId);
+  if (!fromNode || fromNode.kind !== 'method') return null;
+  const sep = fromNode.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // no table receiver (a top-level function)
+  const receiver = fromNode.qualifiedName.slice(0, sep);
+  const hits = context
+    .getNodesByName(methodName)
+    .filter(
+      (n) =>
+        n.language === 'lua' &&
+        n.kind === 'method' &&
+        n.filePath === fromNode.filePath &&
+        n.qualifiedName.startsWith(receiver + '::') &&
+        n.id !== fromNode.id
+    );
+  if (hits.length === 0) return null;
+  return {
+    original: ref,
+    targetNodeId: hits[0]!.id,
+    confidence: 0.7,
+    resolvedBy: 'framework',
+  };
+}
+
+/**
+ * Lua → C# via an instance field: `self.levelJobManager:Init(...)`.
+ *
+ * The field holds a C# object (xLua wraps Unity `AddComponent<T>()` results
+ * and `CS.X.Instance` singletons), so the chain is
+ * Lua method → XLua proxy → C# method. The upstream matcher cannot infer the
+ * field's type (no declaration type in Lua), so we recover it from the
+ * file's own assignment: `self.<field> = AddComponent<Type>()` /
+ * `AddComponent(typeof(Type))` / `CS.Full.Path.Class(.Instance)`. Any of
+ * those yields a dotted C# path, resolved with the same qualifiedName-
+ * validated machinery as `CS.` chains. No assignment → stay unresolved.
+ *
+ * Field→type map is memoized per (context, file), since resolution hits the
+ * same field from many call sites.
+ */
+const luaFieldTypes = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/** Extract `self.<field> = <kind of C# value>` assignments → C# dotted path. */
+function luaFieldCsharpPaths(context: ResolutionContext, filePath: string): Map<string, string> {
+  let byFile = luaFieldTypes.get(context);
+  if (!byFile) {
+    byFile = new Map();
+    luaFieldTypes.set(context, byFile);
+  }
+  const cached = byFile.get(filePath);
+  if (cached) return cached;
+
+  const result = new Map<string, string>();
+  const content = context.readFile(filePath);
+  if (content) {
+    // Whole-file scan: keep the LAST meaningful `self.<field> = …` per field
+    // (memoized, so this runs once per file per resolver lifetime). A
+    // cleanup `self.x = nil` must NOT overwrite the earlier typed assignment
+    // (`self.x = self.root:AddComponent(T)`) it nulls out — skip nils.
+    const assignRe = /self\.([A-Za-z_]\w*)\s*=\s*([^\r\n]+)/g;
+    let am: RegExpExecArray | null;
+    const lastRhs = new Map<string, string>();
+    while ((am = assignRe.exec(content)) !== null) {
+      const rhs = am[2]!.trim();
+      if (!rhs || rhs === 'nil') continue;
+      lastRhs.set(am[1]!, rhs);
+    }
+    // Accepts AddComponent<T>(), AddComponent(typeof(T)) and the xLua
+    // shorthand that passes the C# type table directly: AddComponent(T).
+    const typeRe = /AddComponent\s*(?:<([A-Za-z0-9_.]+)>|\(\s*typeof\s*\(\s*([A-Za-z0-9_.]+)\s*\)\s*\)|\(\s*([A-Za-z0-9_.]+)\s*\))|CS\.([A-Za-z0-9_.]+)/g;
+    for (const [field, rhs] of lastRhs) {
+      let tm: RegExpExecArray | null;
+      typeRe.lastIndex = 0;
+      while ((tm = typeRe.exec(rhs)) !== null) {
+        const found: string | undefined = tm[1] ?? tm[2] ?? tm[3] ?? tm[4];
+        if (found && !/[<"(]/.test(found)) {
+          result.set(field, found);
+        }
+      }
+    }
+  }
+  byFile.set(filePath, result);
+  return result;
+}
+
+/** `self.<field>:Method()` / `self.<field>.Method()` → C# method on the field's type. */
+function resolveLuaFieldCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = ref.referenceName.match(/^self\.([A-Za-z_]\w*)[:.]([A-Za-z_]\w*)$/);
+  if (!m) return null;
+  const [, field, methodName] = m;
+  const csPath = luaFieldCsharpPaths(context, ref.filePath).get(field!);
+  if (process.env.CODEGRAPH_XLUA_DEBUG) {
+    console.error(`[xlua-field] ${ref.filePath}:${ref.line} field=${field} method=${methodName} csPath=${csPath ?? 'NONE'}`);
+  }
+  if (!csPath) return null;
+  const typeNode = csharpTypeForPathCs(csPath, context);
+  if (process.env.CODEGRAPH_XLUA_DEBUG) {
+    console.error(`[xlua-field]   typeNode=${typeNode?.qualifiedName ?? 'NULL'} (lookup "${csPath}")`);
+  }
+  if (!typeNode) return null;
+  const target = csharpMethodOnType(typeNode, methodName!, context);
+  if (process.env.CODEGRAPH_XLUA_DEBUG) {
+    console.error(`[xlua-field]   target=${target?.qualifiedName ?? 'NULL'}`);
+  }
+  if (!target) return null;
+  return {
+    original: ref,
+    targetNodeId: target.id,
+    confidence: 0.7,
+    resolvedBy: 'framework',
+  };
+}
+
+/**
  * Lua → C#. Accepts `CS.A.B`, `CS.A.B:Method`, `CS.A.B.Method` (the
- * extraction shape), and the dialect `xlua.alias.<name>` refs.
+ * extraction shape), the dialect `xlua.alias.<name>` refs, and — first —
+ * the Lua self/field forms (`self:Method()`, `self.mgr:Go()`).
  */
 function resolveLuaToCsharp(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   if (ref.language !== 'lua' && ref.language !== 'luau') return null;
+  if (ref.referenceName.startsWith('self.') || ref.referenceName.startsWith('self:')) {
+    // self.… is either the class-internal call (`self:Init`) or an instance
+    // field call (`self.mgr:Go()`); try the internal one first — it is the
+    // same-file same-table match and wins when both could apply.
+    return resolveLuaSelfCall(ref, context) ?? resolveLuaFieldCall(ref, context);
+  }
   const chain = ref.referenceName;
 
   // Dialect alias: GetCSharp('SceneManagement') / types['Cinemachine'] as value.
@@ -361,6 +502,10 @@ export const xluaBridgeResolver: FrameworkResolver = {
    */
   claimsReference(name) {
     if (name.startsWith('xlua.')) return true;
+    // Lua `self:Method()` / `self.field:Method()` — no node is ever NAMED
+    // `self:…`, so the name-exists pre-filter would drop the ref before the
+    // self/field resolvers above can see it.
+    if (name.startsWith('self.') || name.startsWith('self:')) return true;
     if (name.includes('CS.')) return true;
     return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,3}$/.test(name);
   },
