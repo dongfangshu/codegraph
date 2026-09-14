@@ -29,6 +29,7 @@ import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
+import { xluaBridgeResolver } from './xlua';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { expoRouterResolver } from './expo-router';
@@ -82,6 +83,9 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   vaporResolver,
   // Swift ↔ Objective-C cross-language bridging (mixed iOS apps)
   swiftObjcBridgeResolver,
+  // C# ↔ Lua xLua bridging (Unity projects): `CS.` chains, CSharpCallLua
+  // LuaTable bindings, and the GetCSharp/types[] namespace alias dialect
+  xluaBridgeResolver,
   // React Native JS ↔ native bridge (legacy + TurboModules)
   reactNativeBridgeResolver,
   // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
@@ -171,6 +175,7 @@ export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
+export { xluaBridgeResolver } from './xlua';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { expoRouterResolver } from './expo-router';
